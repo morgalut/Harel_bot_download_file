@@ -9,3 +9,9 @@ playwright install
 ```sh
 python bot_all_in_one.py
 ```
+
+
+## Link 
+```
+https://agents.harel-group.co.il/my.logout.php3?errorcode=19
+```

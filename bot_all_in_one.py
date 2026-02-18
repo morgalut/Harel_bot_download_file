@@ -14,6 +14,18 @@ PULSEEM_API_KEY=...
 PULSEEM_VIRTUAL_NUMBER=053...
 HAREL_USERNAME=...
 HAREL_PASSWORD=...
+
+Optional .env:
+BASE_DOWNLOAD_DIR=C:\FinanceDownloads
+PLAYWRIGHT_HEADLESS=true|false
+
+OTP_LOOKBACK_SECONDS=240
+OTP_MAX_WAIT_SECONDS=90
+OTP_POLL_SECONDS=2
+OTP_INITIAL_DELAY_SECONDS=15
+
+PULSEEM_AUTH_MODE=header|bearer|x-api-key
+PULSEEM_APIKEY_HEADER=ApiKey   (only used when auth_mode=header)
 """
 
 import os
@@ -43,6 +55,9 @@ PULSEEM_APIKEY_HEADER = os.getenv("PULSEEM_APIKEY_HEADER", "ApiKey").strip()
 OTP_LOOKBACK_SECONDS = int(os.getenv("OTP_LOOKBACK_SECONDS", "240"))
 OTP_MAX_WAIT_SECONDS = int(os.getenv("OTP_MAX_WAIT_SECONDS", "90"))
 OTP_POLL_SECONDS = float(os.getenv("OTP_POLL_SECONDS", "2"))
+OTP_INITIAL_DELAY_SECONDS = int(os.getenv("OTP_INITIAL_DELAY_SECONDS", "15"))
+MANUAL_OTP_FALLBACK = os.getenv("MANUAL_OTP_FALLBACK", "true").strip().lower() in ("1", "true", "yes", "y")
+MANUAL_OTP_MAX_WAIT_SECONDS = int(os.getenv("MANUAL_OTP_MAX_WAIT_SECONDS", "240"))
 
 PLAYWRIGHT_HEADLESS = os.getenv("PLAYWRIGHT_HEADLESS", "true").strip().lower() in ("1", "true", "yes", "y")
 
@@ -126,7 +141,12 @@ def get_last_sms_datetime(
     start = datetime.now() - timedelta(seconds=lookback_seconds)
     end = datetime.now()
 
-    data = get_incoming_sms_report(auth, search_txt=vn, start_time=start, end_time=end)
+    try:
+        data = get_incoming_sms_report(auth, search_txt=vn, start_time=start, end_time=end)
+    except Exception:
+        print("[Pulseem] Warning: could not check last SMS")
+        return datetime.min
+
     if str(data.get("status", "")).lower() != "success":
         print("[Pulseem] Warning: could not check last SMS")
         return datetime.min
@@ -145,7 +165,7 @@ def wait_for_otp_from_pulseem(
     max_wait_seconds: int = 90,
     poll_every_seconds: float = 2.0,
 ) -> Tuple[str, Dict[str, Any]]:
-    """Wait for a NEW OTP SMS (with ReplyDate > after_datetime)"""
+    """Wait for a NEW OTP SMS (with ReplyDate > after_datetime). Treat 'NO DATA FOUND' as 'not yet'."""
     vn = normalize_il_number(virtual_number)
     start = datetime.now() - timedelta(seconds=lookback_seconds)
     deadline = time.time() + max_wait_seconds
@@ -159,9 +179,17 @@ def wait_for_otp_from_pulseem(
 
         status = str(data.get("status", "")).lower()
         if status != "success":
+            err = str(data.get("error") or "").lower()
+            # Very common: Pulseem returns NO DATA FOUND when no messages match yet
+            if "no data" in err:
+                time.sleep(poll_every_seconds)
+                continue
             raise RuntimeError(f"Pulseem error: {data.get('error')}")
 
         reports = data.get("IncomingSmsReports", []) or []
+        if not reports:
+            time.sleep(poll_every_seconds)
+            continue
 
         # Filter for fresh messages only
         fresh = []
@@ -196,6 +224,57 @@ def build_pulseem_auth_from_env() -> PulseemAuth:
         raise RuntimeError("OTP required but missing PULSEEM_API_KEY in .env")
     return PulseemAuth(api_key=api_key, mode=PULSEEM_AUTH_MODE, header_name=PULSEEM_APIKEY_HEADER)
 
+def _pulseem_status_is_success(data: Dict[str, Any]) -> bool:
+    return str(data.get("status", "")).strip().lower() == "success"
+
+def _pulseem_error_text(data: Dict[str, Any]) -> str:
+    return str(data.get("error") or data.get("message") or "").strip()
+
+def preflight_check_pulseem_or_die(virtual_number: str, lookback_seconds: int = 86400) -> None:
+    """
+    Validates Pulseem connectivity/auth BEFORE running the bot.
+    Treats 'NO DATA FOUND' as OK (auth works, just no messages).
+    Raises RuntimeError on auth/network/format issues.
+    """
+    print("[Preflight] Checking Pulseem API connectivity/auth...")
+
+    api_key = os.getenv("PULSEEM_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("[Preflight] Missing PULSEEM_API_KEY in .env")
+
+    auth = build_pulseem_auth_from_env()
+
+    vn = normalize_il_number(virtual_number)
+    start = datetime.now() - timedelta(seconds=lookback_seconds)
+    end = datetime.now()
+
+    try:
+        data = get_incoming_sms_report(
+            auth=auth,
+            search_txt=vn,
+            start_time=start,
+            end_time=end,
+            timeout_seconds=20,
+        )
+    except requests.exceptions.HTTPError as e:
+        raise RuntimeError(f"[Preflight] Pulseem HTTP error (check auth/header/key): {e}") from e
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"[Preflight] Pulseem network error: {e}") from e
+    except Exception as e:
+        raise RuntimeError(f"[Preflight] Pulseem unexpected error: {e}") from e
+
+    if _pulseem_status_is_success(data):
+        reports = data.get("IncomingSmsReports", []) or []
+        print(f"[Preflight] Pulseem OK ✅ (success). Messages in lookback: {len(reports)}")
+        return
+
+    err = _pulseem_error_text(data)
+    if "no data" in err.lower():
+        print("[Preflight] Pulseem OK ✅ (NO DATA FOUND in lookback window)")
+        return
+
+    raise RuntimeError(f"[Preflight] Pulseem FAILED ❌ status={data.get('status')} error={err}")
+
 # ----------------------------
 # Playwright helpers
 # ----------------------------
@@ -216,11 +295,9 @@ def click_reconnect_link_if_present(page) -> None:
     This handles the expired session screen.
     """
     print("[Step 1] Checking for 'לחץ כאן' reconnect link...")
-    
-    # Try to find the link with Hebrew text "לחץ כאן"
+
     try:
         link = page.locator('a[href="/"]')
-        # Check if visible within 3 seconds
         if link.first.is_visible(timeout=3000):
             print("[Step 1] Found reconnect link, clicking...")
             with page.expect_navigation(wait_until="domcontentloaded", timeout=10000):
@@ -238,15 +315,11 @@ def fill_login_credentials(page, username: str, password: str) -> None:
     STEP 2: Fill in username and password fields
     """
     print("[Step 2] Filling login credentials...")
-    
-    # Wait for username field
+
     page.wait_for_selector("#input_1", timeout=20000)
-    
-    # Fill username
     page.fill("#input_1", username)
     print(f"[Step 2] Filled username: {username[:3]}***")
-    
-    # Fill password
+
     page.fill("#input_2", password)
     print("[Step 2] Filled password: ***")
 
@@ -255,84 +328,128 @@ def click_submit_button(page) -> None:
     STEP 3: Click the submit button (אישור)
     """
     print("[Step 3] Clicking submit button...")
-    
+
     submit_selector = 'input.credentials_input_submit[value="אישור"]'
-    
+
     try:
-        # Try with navigation expectation first
         with page.expect_navigation(wait_until="domcontentloaded", timeout=15000):
             safe_click(page, submit_selector)
         print("[Step 3] Submit clicked with navigation")
     except PWTimeout:
-        # If no navigation, just click
         safe_click(page, submit_selector)
         print("[Step 3] Submit clicked (no navigation detected)")
 
 def maybe_handle_otp(page, selectors: Dict[str, str]) -> None:
     """
-    STEP 4: Handle OTP if screen appears
-    Only uses Pulseem API after connection is established
+    STEP 4: Handle OTP if screen appears.
+    1) Try to fetch OTP from Pulseem.
+    2) If Pulseem doesn't get an SMS in time, allow manual OTP entry via console.
     """
+
     otp_input = selectors.get("otp_input") or ""
     otp_submit = selectors.get("otp_submit") or ""
-    
+
     if not otp_input or not otp_submit:
         print("[Step 4] OTP selectors not configured, skipping OTP handling")
         return
 
     print("[Step 4] Checking for OTP screen...")
-    
+
     try:
-        # Check if OTP input exists
-        page.wait_for_selector(otp_input, timeout=5000)
+        # Detect OTP input
+        page.wait_for_selector(otp_input, timeout=7000)
         print("[Step 4] OTP screen detected!")
 
-        # Now that we're connected and on OTP screen, build Pulseem auth
-        auth = build_pulseem_auth_from_env()
+        # Give the site time to send the SMS
+        print(f"[Step 4] Waiting {OTP_INITIAL_DELAY_SECONDS}s for SMS to be sent...")
+        time.sleep(OTP_INITIAL_DELAY_SECONDS)
 
-        # Get checkpoint (last SMS before we request new OTP)
-        checkpoint_dt = get_last_sms_datetime(PULSEEM_VIRTUAL_NUMBER, auth, lookback_seconds=600)
-        if checkpoint_dt != datetime.min:
-            print(f"[Step 4] Checkpoint: last SMS at {checkpoint_dt.isoformat()}")
-        else:
-            print("[Step 4] Checkpoint: no previous SMS found")
-
-        # Click "send code" button if it exists
+        # Optional: click "send code" button if exists
         send_btn = selectors.get("send_code_button") or ""
         if send_btn:
             try:
                 print("[Step 4] Clicking 'send code' button...")
                 safe_click(page, send_btn, timeout_ms=5000)
-                print("[Step 4] Send code button clicked")
+                print("[Step 4] Send code clicked")
+                time.sleep(3)
             except PWTimeout:
-                print("[Step 4] Send code button not found or not needed")
+                print("[Step 4] Send code button not found")
 
-        # Wait for NEW OTP from Pulseem
-        print("[Step 4] Waiting for OTP from Pulseem API...")
-        otp, msg = wait_for_otp_from_pulseem(
-            virtual_number=PULSEEM_VIRTUAL_NUMBER,
-            auth=auth,
-            after_datetime=checkpoint_dt,
-            lookback_seconds=OTP_LOOKBACK_SECONDS,
-            max_wait_seconds=OTP_MAX_WAIT_SECONDS,
-            poll_every_seconds=OTP_POLL_SECONDS,
-        )
+        otp: Optional[str] = None
+        msg: Optional[Dict[str, Any]] = None
 
-        print(f"[Step 4] Received OTP: {otp}, ReplyDate: {msg.get('ReplyDate')}")
-        
-        # Fill OTP
-        page.fill(otp_input, otp)
-        print("[Step 4] Filled OTP into input field")
-        
-        # Submit OTP
-        safe_click(page, otp_submit, timeout_ms=15000)
-        print("[Step 4] OTP submitted successfully")
+        # ---- Try Pulseem first ----
+        try:
+            auth = build_pulseem_auth_from_env()
+
+            checkpoint_dt = get_last_sms_datetime(PULSEEM_VIRTUAL_NUMBER, auth, lookback_seconds=600)
+            if checkpoint_dt != datetime.min:
+                print(f"[Step 4] Checkpoint: last SMS at {checkpoint_dt.isoformat()}")
+            else:
+                print("[Step 4] Checkpoint: no previous SMS found")
+
+            print("[Step 4] Waiting for OTP from Pulseem API...")
+            otp, msg = wait_for_otp_from_pulseem(
+                virtual_number=PULSEEM_VIRTUAL_NUMBER,
+                auth=auth,
+                after_datetime=checkpoint_dt,
+                lookback_seconds=OTP_LOOKBACK_SECONDS,
+                max_wait_seconds=OTP_MAX_WAIT_SECONDS,
+                poll_every_seconds=OTP_POLL_SECONDS,
+            )
+            print(f"[Step 4] Received OTP from Pulseem: {otp}, ReplyDate: {msg.get('ReplyDate') if msg else None}")
+
+        except Exception as e:
+            print(f"[Step 4] Pulseem OTP failed / not received: {e}")
+
+            # ---- Manual fallback ----
+            if not MANUAL_OTP_FALLBACK:
+                raise
+
+            print("[Step 4] Manual OTP fallback ENABLED.")
+            print(f"[Step 4] Please enter the OTP manually (you have up to {MANUAL_OTP_MAX_WAIT_SECONDS}s).")
+
+            start = time.time()
+            manual = ""
+            while time.time() - start < MANUAL_OTP_MAX_WAIT_SECONDS:
+                manual = input("Enter OTP code: ").strip()
+                if manual:
+                    break
+
+            if not manual:
+                raise TimeoutError("Manual OTP entry timed out / empty input.")
+
+            otp = manual
+            print("[Step 4] Manual OTP received.")
+
+        # ---- Fill OTP ----
+        if not otp:
+            raise RuntimeError("OTP is empty - cannot continue.")
+
+        page.wait_for_selector(otp_input, timeout=15000)
+        page.fill(otp_input, "")
+        page.type(otp_input, otp, delay=80)
+        print("[Step 4] OTP entered")
+
+        time.sleep(0.7)
+
+        # ---- Submit OTP ----
+        try:
+            with page.expect_navigation(wait_until="domcontentloaded", timeout=15000):
+                safe_click(page, otp_submit, timeout_ms=15000)
+            print("[Step 4] OTP submitted with navigation")
+        except PWTimeout:
+            safe_click(page, otp_submit, timeout_ms=15000)
+            print("[Step 4] OTP submitted (AJAX/no navigation)")
+
+        time.sleep(1.5)
 
     except PWTimeout:
         print("[Step 4] No OTP screen detected, continuing...")
     except Exception as e:
         print(f"[Step 4] OTP handling failed: {e}")
         raise
+
 
 def download_one(page, click_selector: str, download_dir: Path) -> Path:
     """Download a file by clicking a selector"""
@@ -358,13 +475,15 @@ SITES: List[Dict[str, Any]] = [
             "pass_input": "#input_2",
             "login_submit": 'input.credentials_input_submit[value="אישור"]',
 
-            # TODO: Update these with actual OTP selectors from the OTP page HTML
-            "otp_input": "",  # e.g., 'input[name="otp"]' or '#otp_code'
-            "otp_submit": "",  # e.g., 'input[type="submit"][value="אישור"]'
-            # "send_code_button": "",  # optional: if there's a "send code" button
+            # OTP page selectors (based on your HTML)
+            "otp_input": 'input[name="otpass"]#input_1',
+            "otp_submit": 'input.credentials_input_submit[type="submit"][value="אישור"]',
+
+            # optional if exists on OTP page:
+            # "send_code_button": 'button:has-text("שלח")'
         },
         "downloads": [
-            # TODO: Add download selectors once identified
+            # Add download selectors once identified
         ],
     }
 ]
@@ -382,6 +501,9 @@ def main():
     print(f"Pulseem virtual number: {PULSEEM_VIRTUAL_NUMBER}")
     print("=" * 60)
 
+    # ✅ Preflight: verify Pulseem connectivity/auth before running browser automation
+    preflight_check_pulseem_or_die(PULSEEM_VIRTUAL_NUMBER)
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=PLAYWRIGHT_HEADLESS)
         context = browser.new_context(accept_downloads=True)
@@ -390,24 +512,23 @@ def main():
             print(f"\n{'=' * 60}")
             print(f"Processing: {site['name']}")
             print(f"{'=' * 60}")
-            
+
             page = context.new_page()
 
             try:
-                # Navigate to login page
                 print(f"[Start] Navigating to {site['login_url']}")
                 page.goto(site["login_url"], wait_until="domcontentloaded")
 
-                # STEP 1: Check for and click reconnect link if present
+                # STEP 1
                 click_reconnect_link_if_present(page)
 
-                # STEP 2: Fill in credentials
+                # STEP 2
                 fill_login_credentials(page, site["username"], site["password"])
 
-                # STEP 3: Click submit button
+                # STEP 3
                 click_submit_button(page)
 
-                # STEP 4: Handle OTP if needed (only now Pulseem API is called)
+                # STEP 4
                 maybe_handle_otp(page, site["selectors"])
 
                 # Navigate to reports page if specified
