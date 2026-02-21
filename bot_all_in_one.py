@@ -1,31 +1,15 @@
 """
 bot_all_in_one.py - Harel Agents Automation with Pulseem OTP
 
-Flow:
-1. Navigate to login page
-2. Check for "לחץ כאן" reconnect link and click if present
-3. Fill username and password
-4. Click submit button (אישור)
-5. If OTP screen appears, use Pulseem API to get verification code
-6. Enter OTP and submit
-
-Required .env:
-PULSEEM_API_KEY=...
-PULSEEM_VIRTUAL_NUMBER=053...
-HAREL_USERNAME=...
-HAREL_PASSWORD=...
-
-Optional .env:
-BASE_DOWNLOAD_DIR=C:\FinanceDownloads
-PLAYWRIGHT_HEADLESS=true|false
-
-OTP_LOOKBACK_SECONDS=240
-OTP_MAX_WAIT_SECONDS=90
-OTP_POLL_SECONDS=2
-OTP_INITIAL_DELAY_SECONDS=15
-
-PULSEEM_AUTH_MODE=header|bearer|x-api-key
-PULSEEM_APIKEY_HEADER=ApiKey   (only used when auth_mode=header)
+Adds post-login flow:
+- Open "דוחות חיים, בריאות וחיסכון"
+- Click "סוכן"
+- Click "דוח ריכוז תשלומים"
+- Choose company 113005565...
+- Click "סנן מידע"
+- Find latest "תאריך פעולה" row
+- Click "נפרעים" in that row
+- Validate agent number = 165 and click month amount cell in that row
 """
 
 import os
@@ -79,7 +63,6 @@ OTP_REGEX = re.compile(r"\b(\d{4,8})\b")
 # Pulseem helpers
 # ----------------------------
 def normalize_il_number(num: str) -> str:
-    """Normalize Israeli phone number to 972XXXXXXXXX format"""
     s = "".join(ch for ch in num.strip() if ch.isdigit())
     if s.startswith("0") and len(s) == 10:
         return "972" + s[1:]
@@ -136,7 +119,6 @@ def get_last_sms_datetime(
     auth: PulseemAuth,
     lookback_seconds: int = 600,
 ) -> datetime:
-    """Get the timestamp of the most recent SMS before we request OTP"""
     vn = normalize_il_number(virtual_number)
     start = datetime.now() - timedelta(seconds=lookback_seconds)
     end = datetime.now()
@@ -165,7 +147,6 @@ def wait_for_otp_from_pulseem(
     max_wait_seconds: int = 90,
     poll_every_seconds: float = 2.0,
 ) -> Tuple[str, Dict[str, Any]]:
-    """Wait for a NEW OTP SMS (with ReplyDate > after_datetime). Treat 'NO DATA FOUND' as 'not yet'."""
     vn = normalize_il_number(virtual_number)
     start = datetime.now() - timedelta(seconds=lookback_seconds)
     deadline = time.time() + max_wait_seconds
@@ -180,7 +161,6 @@ def wait_for_otp_from_pulseem(
         status = str(data.get("status", "")).lower()
         if status != "success":
             err = str(data.get("error") or "").lower()
-            # Very common: Pulseem returns NO DATA FOUND when no messages match yet
             if "no data" in err:
                 time.sleep(poll_every_seconds)
                 continue
@@ -191,7 +171,6 @@ def wait_for_otp_from_pulseem(
             time.sleep(poll_every_seconds)
             continue
 
-        # Filter for fresh messages only
         fresh = []
         newest_dt = last_seen_dt
         for msg in reports:
@@ -204,7 +183,6 @@ def wait_for_otp_from_pulseem(
         if newest_dt > last_seen_dt:
             last_seen_dt = newest_dt
 
-        # Check fresh messages for OTP
         fresh_sorted = sorted(fresh, key=lambda x: parse_reply_date(str(x.get("ReplyDate", ""))), reverse=True)
         for msg in fresh_sorted:
             text = str(msg.get("ReplyText") or "")
@@ -218,7 +196,6 @@ def wait_for_otp_from_pulseem(
     raise TimeoutError("No NEW OTP SMS arrived within the configured wait window.")
 
 def build_pulseem_auth_from_env() -> PulseemAuth:
-    """Build Pulseem auth object (only called when OTP is needed)"""
     api_key = os.getenv("PULSEEM_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("OTP required but missing PULSEEM_API_KEY in .env")
@@ -231,11 +208,6 @@ def _pulseem_error_text(data: Dict[str, Any]) -> str:
     return str(data.get("error") or data.get("message") or "").strip()
 
 def preflight_check_pulseem_or_die(virtual_number: str, lookback_seconds: int = 86400) -> None:
-    """
-    Validates Pulseem connectivity/auth BEFORE running the bot.
-    Treats 'NO DATA FOUND' as OK (auth works, just no messages).
-    Raises RuntimeError on auth/network/format issues.
-    """
     print("[Preflight] Checking Pulseem API connectivity/auth...")
 
     api_key = os.getenv("PULSEEM_API_KEY", "").strip()
@@ -279,23 +251,16 @@ def preflight_check_pulseem_or_die(virtual_number: str, lookback_seconds: int = 
 # Playwright helpers
 # ----------------------------
 def safe_click(page, selector: str, timeout_ms: int = 15000) -> None:
-    """Wait for element and click it"""
     page.wait_for_selector(selector, timeout=timeout_ms)
     page.click(selector)
 
 def ensure_today_dir(base_dir: str) -> Path:
-    """Create and return today's download directory"""
     today_dir = Path(base_dir) / datetime.now().date().isoformat()
     today_dir.mkdir(parents=True, exist_ok=True)
     return today_dir
 
 def click_reconnect_link_if_present(page) -> None:
-    """
-    STEP 1: Check if the 'לחץ כאן' (Click here) reconnect link exists and click it.
-    This handles the expired session screen.
-    """
     print("[Step 1] Checking for 'לחץ כאן' reconnect link...")
-
     try:
         link = page.locator('a[href="/"]')
         if link.first.is_visible(timeout=3000):
@@ -311,26 +276,16 @@ def click_reconnect_link_if_present(page) -> None:
         print(f"[Step 1] Could not click reconnect link: {e}, proceeding...")
 
 def fill_login_credentials(page, username: str, password: str) -> None:
-    """
-    STEP 2: Fill in username and password fields
-    """
     print("[Step 2] Filling login credentials...")
-
     page.wait_for_selector("#input_1", timeout=20000)
     page.fill("#input_1", username)
     print(f"[Step 2] Filled username: {username[:3]}***")
-
     page.fill("#input_2", password)
     print("[Step 2] Filled password: ***")
 
 def click_submit_button(page) -> None:
-    """
-    STEP 3: Click the submit button (אישור)
-    """
     print("[Step 3] Clicking submit button...")
-
     submit_selector = 'input.credentials_input_submit[value="אישור"]'
-
     try:
         with page.expect_navigation(wait_until="domcontentloaded", timeout=15000):
             safe_click(page, submit_selector)
@@ -340,12 +295,6 @@ def click_submit_button(page) -> None:
         print("[Step 3] Submit clicked (no navigation detected)")
 
 def maybe_handle_otp(page, selectors: Dict[str, str]) -> None:
-    """
-    STEP 4: Handle OTP if screen appears.
-    1) Try to fetch OTP from Pulseem.
-    2) If Pulseem doesn't get an SMS in time, allow manual OTP entry via console.
-    """
-
     otp_input = selectors.get("otp_input") or ""
     otp_submit = selectors.get("otp_submit") or ""
 
@@ -356,15 +305,12 @@ def maybe_handle_otp(page, selectors: Dict[str, str]) -> None:
     print("[Step 4] Checking for OTP screen...")
 
     try:
-        # Detect OTP input
         page.wait_for_selector(otp_input, timeout=7000)
         print("[Step 4] OTP screen detected!")
 
-        # Give the site time to send the SMS
         print(f"[Step 4] Waiting {OTP_INITIAL_DELAY_SECONDS}s for SMS to be sent...")
         time.sleep(OTP_INITIAL_DELAY_SECONDS)
 
-        # Optional: click "send code" button if exists
         send_btn = selectors.get("send_code_button") or ""
         if send_btn:
             try:
@@ -378,10 +324,8 @@ def maybe_handle_otp(page, selectors: Dict[str, str]) -> None:
         otp: Optional[str] = None
         msg: Optional[Dict[str, Any]] = None
 
-        # ---- Try Pulseem first ----
         try:
             auth = build_pulseem_auth_from_env()
-
             checkpoint_dt = get_last_sms_datetime(PULSEEM_VIRTUAL_NUMBER, auth, lookback_seconds=600)
             if checkpoint_dt != datetime.min:
                 print(f"[Step 4] Checkpoint: last SMS at {checkpoint_dt.isoformat()}")
@@ -402,7 +346,6 @@ def maybe_handle_otp(page, selectors: Dict[str, str]) -> None:
         except Exception as e:
             print(f"[Step 4] Pulseem OTP failed / not received: {e}")
 
-            # ---- Manual fallback ----
             if not MANUAL_OTP_FALLBACK:
                 raise
 
@@ -422,7 +365,6 @@ def maybe_handle_otp(page, selectors: Dict[str, str]) -> None:
             otp = manual
             print("[Step 4] Manual OTP received.")
 
-        # ---- Fill OTP ----
         if not otp:
             raise RuntimeError("OTP is empty - cannot continue.")
 
@@ -433,7 +375,6 @@ def maybe_handle_otp(page, selectors: Dict[str, str]) -> None:
 
         time.sleep(0.7)
 
-        # ---- Submit OTP ----
         try:
             with page.expect_navigation(wait_until="domcontentloaded", timeout=15000):
                 safe_click(page, otp_submit, timeout_ms=15000)
@@ -450,15 +391,243 @@ def maybe_handle_otp(page, selectors: Dict[str, str]) -> None:
         print(f"[Step 4] OTP handling failed: {e}")
         raise
 
-
 def download_one(page, click_selector: str, download_dir: Path) -> Path:
-    """Download a file by clicking a selector"""
     with page.expect_download() as d:
         safe_click(page, click_selector, timeout_ms=20000)
     dl = d.value
     target = download_dir / dl.suggested_filename
     dl.save_as(str(target))
     return target
+
+
+
+
+
+def handle_paid_window_and_download(parent_page, download_dir: Path) -> Path:
+    """
+    Handles the new window/tab that opens after clicking the month amount:
+    - open dropdown (div.ctrlbutton.cbo)
+    - click 'בחר הכל' (div.selectall)
+    - click 'סנן מידע' (button.filter-apply...)
+    - click Excel (button.bar-excel) and download file
+    Returns the saved file path.
+    """
+    print("[Paid] Waiting for paid.aspx window to open...")
+
+    # The popup is usually created right after the click that opened it.
+    # In our flow we will call this only after we already clicked the month cell,
+    # so the popup should already exist or appear quickly.
+    paid_page = None
+    try:
+        # If popup already opened, Playwright often has it as the newest page in the context.
+        ctx = parent_page.context
+        pages = ctx.pages
+        paid_page = pages[-1] if pages else None
+
+        # If for some reason it's still the same page, wait for a new one.
+        if paid_page is None or paid_page == parent_page:
+            paid_page = ctx.wait_for_event("page", timeout=20000)
+
+        paid_page.wait_for_load_state("domcontentloaded", timeout=20000)
+
+        # sanity: check URL contains paid.aspx (not mandatory, but helpful)
+        try:
+            if "paid.aspx" not in (paid_page.url or ""):
+                print(f"[Paid] Opened page URL (not confirmed paid.aspx): {paid_page.url}")
+            else:
+                print(f"[Paid] Paid window URL: {paid_page.url}")
+        except Exception:
+            pass
+
+    except Exception as e:
+        raise RuntimeError(f"[Paid] Could not detect paid window: {e}") from e
+
+    # 1) Open dropdown
+    print("[Paid] Opening dropdown...")
+    paid_page.locator("div.ctrlbutton.cbo").first.wait_for(timeout=20000)
+    paid_page.locator("div.ctrlbutton.cbo").first.click()
+    time.sleep(0.4)
+
+    # 2) Click "בחר הכל"
+    print('[Paid] Clicking "בחר הכל"...')
+    paid_page.locator('div.selectall[role="button"]').filter(has_text="בחר הכל").first.wait_for(timeout=20000)
+    paid_page.locator('div.selectall[role="button"]').filter(has_text="בחר הכל").first.click()
+    time.sleep(0.4)
+
+    # 3) Click "סנן מידע"
+    print('[Paid] Clicking "סנן מידע"...')
+    # Prefer role-based; fallback to CSS
+    try:
+        paid_page.get_by_role("button", name=re.compile(r"^\s*סנן מידע\s*$")).click(timeout=20000)
+    except Exception:
+        paid_page.locator("button.filter-apply").first.click(timeout=20000)
+
+    # give AJAX time to render results
+    time.sleep(2.0)
+
+    # 4) Click Excel and download
+    print('[Paid] Clicking Excel download (button.bar-excel)...')
+    excel_btn = paid_page.locator("button.bar-excel").first
+    excel_btn.wait_for(timeout=20000)
+
+    with paid_page.expect_download(timeout=60000) as d:
+        excel_btn.click()
+
+    dl = d.value
+    target = download_dir / dl.suggested_filename
+    dl.save_as(str(target))
+    print(f"[Paid] Excel saved to: {target}")
+
+    return target
+
+# ----------------------------
+# NEW: Post-login / reports flow
+# ----------------------------
+def _parse_il_date_ddmmyyyy(s: str) -> Optional[datetime]:
+    s = (s or "").strip()
+    try:
+        return datetime.strptime(s, "%d/%m/%Y")
+    except Exception:
+        return None
+
+def run_payments_assembly_flow(page, download_dir: Path) -> None:
+    """
+    After OTP success:
+    - open SPAN menu
+    - click סוכן
+    - click דוח ריכוז תשלומים
+    - select company
+    - filter
+    - pick latest row by תאריך פעולה
+    - click נפרעים in that row
+    - validate agent 165 then click month amount cell in that row
+    """
+    print("[Post] Starting payments assembly flow...")
+
+    # 1) Open the main SPAN/menu
+    #    <span>דוחות חיים, בריאות וחיסכון</span>
+    try:
+        print('[Post] Opening menu: "דוחות חיים, בריאות וחיסכון"')
+        page.get_by_text("דוחות חיים, בריאות וחיסכון", exact=True).click(timeout=20000)
+        time.sleep(0.5)
+    except Exception as e:
+        print(f'[Post] Warning: could not click menu span (maybe already open): {e}')
+
+    # 2) Click "סוכן"
+    print('[Post] Clicking: "סוכן"')
+    page.get_by_text("סוכן", exact=True).click(timeout=20000)
+    time.sleep(0.5)
+
+    # 3) Click "דוח ריכוז תשלומים"
+    print('[Post] Clicking report link: "דוח ריכוז תשלומים"')
+    # Prefer role=link, fallback to text.
+    link = page.get_by_role("link", name=re.compile(r"^\s*דוח ריכוז תשלומים\s*$"))
+    try:
+        with page.expect_navigation(wait_until="domcontentloaded", timeout=20000):
+            link.click()
+    except PWTimeout:
+        link.click()
+    time.sleep(1.5)
+
+    # 4) Open the dropdown / scroll bar control (div.ctrlbutton.cbo)
+    print("[Post] Opening company dropdown...")
+    page.locator("div.ctrlbutton.cbo").first.click(timeout=20000)
+    time.sleep(0.5)
+
+    # 5) Click company option
+    company_text = "113005565 - ידידים הסדרים פנסיוניים בע\"מ"
+    print(f"[Post] Selecting company: {company_text}")
+    page.get_by_role("button", name=re.compile(r"^113005565\s+-\s+ידידים")).click(timeout=20000)
+    time.sleep(0.5)
+
+    # 6) Click filter apply button "סנן מידע"
+    print('[Post] Clicking: "סנן מידע"')
+    page.get_by_role("button", name=re.compile(r"^\s*סנן מידע\s*$")).click(timeout=20000)
+    time.sleep(2.0)
+
+    # 7) Find latest date row by td[data_colid="Date_Hatama_Desc"]
+    print('[Post] Finding latest "תאריך פעולה" row...')
+    date_cells = page.locator('td[data_colid="Date_Hatama_Desc"]')
+    date_cells.first.wait_for(timeout=20000)
+
+    count = date_cells.count()
+    if count == 0:
+        raise RuntimeError('No date cells found (td[data_colid="Date_Hatama_Desc"]).')
+
+    best_idx = -1
+    best_dt = datetime.min
+
+    for i in range(count):
+        cell = date_cells.nth(i)
+        txt = (cell.inner_text() or "").strip()
+        # inner_text may include extra icons/whitespace; pull a dd/mm/yyyy match.
+        m = re.search(r"(\d{2}/\d{2}/\d{4})", txt)
+        if not m:
+            continue
+        dt = _parse_il_date_ddmmyyyy(m.group(1))
+        if dt and dt > best_dt:
+            best_dt = dt
+            best_idx = i
+
+    if best_idx < 0:
+        raise RuntimeError('Could not parse any dd/mm/yyyy from "תאריך פעולה" cells.')
+
+    print(f"[Post] Latest date found: {best_dt.strftime('%d/%m/%Y')} (row idx={best_idx})")
+
+    # We assume all columns align by row index (same ordering).
+    latest_date_cell = date_cells.nth(best_idx)
+
+    # 8) Click "נפרעים" cell in same row index (within SPAN)
+    print('[Post] Clicking "נפרעים" value for latest row...')
+    nifraim_cell = page.locator('td[data_colid="Schum_Nifraim"]').nth(best_idx)
+    # click inside <span dir="ltr">...</span>
+    nifraim_span = nifraim_cell.locator("span").first
+    nifraim_span.wait_for(timeout=20000)
+    nifraim_span.click()
+    time.sleep(1.0)
+
+    # 9) Validate agent number column equals 165
+    print('[Post] Validating agent number (מספר סוכן) == 165...')
+    agent_cell = page.locator('td[data_colid="Sochen_ID"]').nth(best_idx)
+    agent_text = (agent_cell.inner_text() or "").strip()
+    agent_digits = re.search(r"\d+", agent_text)
+    agent_num = agent_digits.group(0) if agent_digits else ""
+
+    if agent_num != "165":
+        raise RuntimeError(f"[Post] Agent number mismatch: expected 165, got '{agent_text}'")
+
+    print("[Post] Agent number OK (165).")
+
+    # 10) Click the month amount cell in that row and catch the popup.
+    print("[Post] Clicking month amount cell in latest row (expects popup)...")
+    month_cell = page.locator('td[data_colid="_M2_Schum"]').nth(best_idx)
+    month_span = month_cell.locator("span").first
+    month_span.wait_for(timeout=20000)
+
+    # The click usually opens a new tab/window.
+    # We try to capture it reliably.
+    ctx = page.context
+    popup = None
+    try:
+        with ctx.expect_page(timeout=20000) as pop:
+            month_span.click()
+        popup = pop.value
+        popup.wait_for_load_state("domcontentloaded", timeout=20000)
+        print(f"[Post] Popup opened: {popup.url}")
+    except PWTimeout:
+        # Fallback: click happened but popup detection timed out.
+        # We'll let the paid handler try to find the newest page.
+        month_span.click()
+        print("[Post] Popup not captured via expect_page; will try to find it via context pages.")
+
+    time.sleep(1.0)
+
+    # ✅ NEW: handle the paid.aspx window actions and download the Excel
+    saved_excel = handle_paid_window_and_download(page, download_dir)
+    print(f"[Post] Paid Excel downloaded: {saved_excel}")
+
+    print("[Post] Payments assembly flow done ✅")
+
 
 # ----------------------------
 # Sites config (Harel)
@@ -475,16 +644,10 @@ SITES: List[Dict[str, Any]] = [
             "pass_input": "#input_2",
             "login_submit": 'input.credentials_input_submit[value="אישור"]',
 
-            # OTP page selectors (based on your HTML)
             "otp_input": 'input[name="otpass"]#input_1',
             "otp_submit": 'input.credentials_input_submit[type="submit"][value="אישור"]',
-
-            # optional if exists on OTP page:
-            # "send_code_button": 'button:has-text("שלח")'
         },
-        "downloads": [
-            # Add download selectors once identified
-        ],
+        "downloads": [],
     }
 ]
 
@@ -501,7 +664,6 @@ def main():
     print(f"Pulseem virtual number: {PULSEEM_VIRTUAL_NUMBER}")
     print("=" * 60)
 
-    # ✅ Preflight: verify Pulseem connectivity/auth before running browser automation
     preflight_check_pulseem_or_die(PULSEEM_VIRTUAL_NUMBER)
 
     with sync_playwright() as p:
@@ -519,33 +681,14 @@ def main():
                 print(f"[Start] Navigating to {site['login_url']}")
                 page.goto(site["login_url"], wait_until="domcontentloaded")
 
-                # STEP 1
                 click_reconnect_link_if_present(page)
-
-                # STEP 2
                 fill_login_credentials(page, site["username"], site["password"])
-
-                # STEP 3
                 click_submit_button(page)
-
-                # STEP 4
                 maybe_handle_otp(page, site["selectors"])
 
-                # Navigate to reports page if specified
-                if site.get("reports_url"):
-                    print(f"[Navigation] Going to reports page: {site['reports_url']}")
-                    page.goto(site["reports_url"], wait_until="domcontentloaded")
+                # ✅ NEW: run the full post-OTP process you requested
+                run_payments_assembly_flow(page, download_dir)
 
-                # Execute any additional navigation steps
-                for step in site["selectors"].get("nav_steps", []):
-                    print(f"[Navigation] Clicking: {step}")
-                    safe_click(page, step, timeout_ms=20000)
-
-                # Download files if configured
-                for item in site.get("downloads", []):
-                    print(f"[Download] Downloading via: {item['click_selector']}")
-                    saved = download_one(page, item["click_selector"], download_dir)
-                    print(f"[Download] Saved to: {saved}")
 
                 print(f"\n✓ {site['name']} completed successfully!")
 
